@@ -1,6 +1,6 @@
 import numpy as np
 from moviepy import Clip, ColorClip, CompositeVideoClip, vfx
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 
 # FadeIn
@@ -143,3 +143,59 @@ def zoomout_transition(clip: Clip, t: float) -> Clip:
         return _zoom_frame(get_frame(current_time), scale_factor)
 
     return clip.transform(scale_effect)
+
+
+# Cinematic color grade: mild contrast/saturation boost plus a soft vignette.
+# Vignette masks are cached per-resolution since stock clips share a handful
+# of output sizes and recomputing the radial gradient every frame is wasted
+# work at 30-60fps.
+_VIGNETTE_CACHE: dict = {}
+
+
+def _vignette_mask(width: int, height: int) -> np.ndarray:
+    key = (width, height)
+    cached = _VIGNETTE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    y, x = np.ogrid[:height, :width]
+    cx, cy = width / 2, height / 2
+    max_dist = (cx**2 + cy**2) ** 0.5
+    dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2) / max_dist
+    # Keep the center untouched; only darken the outer ~45% toward the edges.
+    mask = 1 - np.clip((dist - 0.55) / 0.45, 0, 1) * 0.35
+    mask = mask.astype(np.float32)
+    _VIGNETTE_CACHE[key] = mask
+    return mask
+
+
+def _apply_cinematic_grade(frame: np.ndarray) -> np.ndarray:
+    # Degenerate frames (near-zero size, float dtype from an upstream
+    # transform) can't go through PIL's Image.fromarray. Rather than abort
+    # the whole clip over a handful of bad frames, pass those through
+    # unmodified — a few ungraded frames are invisible; a dropped clip isn't.
+    if frame.dtype != np.uint8 or frame.ndim != 3 or min(frame.shape[:2]) < 2:
+        return frame
+
+    try:
+        image = Image.fromarray(frame)
+        image = ImageEnhance.Contrast(image).enhance(1.12)
+        image = ImageEnhance.Color(image).enhance(1.15)
+        image = ImageEnhance.Brightness(image).enhance(0.97)
+        graded = np.asarray(image).astype(np.float32)
+
+        height, width = graded.shape[:2]
+        mask = _vignette_mask(width, height)
+        graded *= mask[..., None]
+        return np.clip(graded, 0, 255).astype(np.uint8)
+    except Exception:
+        return frame
+
+
+def cinematic_grade(clip: Clip) -> Clip:
+    """Apply a subtle cinematic color grade (contrast/saturation/vignette)."""
+
+    def grade_effect(get_frame, current_time: float):
+        return _apply_cinematic_grade(get_frame(current_time))
+
+    return clip.transform(grade_effect)

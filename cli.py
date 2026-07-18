@@ -210,8 +210,12 @@ Output and exit status:
     material_group.add_argument(
         "--video-source",
         default="pexels",
-        choices=["pexels", "pixabay", "coverr", "local"],
-        help="video material provider; online providers require matching API keys in config.toml",
+        choices=["pexels", "pixabay", "coverr", "local", "seedance"],
+        help=(
+            "video material provider; online providers require matching API keys in "
+            "config.toml; 'seedance' generates AI video clips via fal.ai instead of "
+            "fetching stock footage"
+        ),
     )
     material_group.add_argument(
         "--video-materials",

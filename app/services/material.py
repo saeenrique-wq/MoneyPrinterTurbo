@@ -241,6 +241,64 @@ def search_videos_coverr(
     return []
 
 
+def search_videos_seedance(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+) -> List[MaterialInfo]:
+    """Generate one AI video clip via fal.ai's Seedance 2.0 text-to-video API.
+
+    Unlike the stock-footage providers, this doesn't "search" existing
+    material — it generates a brand new clip per call, billed per second of
+    output. Each call therefore returns at most one MaterialInfo, matching
+    the shape download_videos() already expects from a "search".
+    """
+    api_key = get_api_key("seedance_api_key")
+    # API accepts 4-15s per clip; clamp the caller's requested duration into
+    # that range rather than failing the whole generation over an edge case.
+    duration = max(4, min(15, int(minimum_duration) or 5))
+    prompt = (
+        f"Cinematic professional b-roll footage: {search_term}. "
+        "High quality, smooth camera movement, realistic lighting, no text overlays."
+    )
+
+    try:
+        r = requests.post(
+            "https://fal.run/bytedance/seedance-2.0/text-to-video",
+            headers={
+                "Authorization": f"Key {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "prompt": prompt,
+                "resolution": "720p",
+                "duration": str(duration),
+                "aspect_ratio": VideoAspect(video_aspect).value,
+                "generate_audio": False,
+            },
+            proxies=config.proxy,
+            verify=_get_tls_verify(),
+            # Seedance generations typically finish within ~2 minutes; give
+            # it real headroom before giving up on a call that's already
+            # being billed.
+            timeout=(30, 240),
+        )
+        response = r.json()
+        video_url = (response.get("video") or {}).get("url")
+        if not video_url:
+            logger.error(f"seedance generation failed: {response}")
+            return []
+        item = MaterialInfo()
+        item.provider = "seedance"
+        item.url = video_url
+        item.duration = duration
+        return [item]
+    except Exception as e:
+        logger.error(f"seedance generation failed: {str(e)}")
+
+    return []
+
+
 def save_video(video_url: str, save_dir: str = "") -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
@@ -316,6 +374,8 @@ def download_videos(
         search_videos = search_videos_pixabay
     elif source == "coverr":
         search_videos = search_videos_coverr
+    elif source == "seedance":
+        search_videos = search_videos_seedance
 
     material_directory = config.app.get("material_directory", "").strip()
     if material_directory == "task":

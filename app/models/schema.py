@@ -105,13 +105,22 @@ class VideoParams(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
+    # Word-by-word animated captions (requires subtitle_provider="whisper" for
+    # per-word timestamps; TTS providers without word timing fall back to the
+    # static line-level rendering even when this is enabled).
+    animated_captions: bool = config.ui.get("animated_captions", False)
+    animated_caption_highlight_color: Optional[str] = config.ui.get(
+        "animated_caption_highlight_color", "#FFD400"
+    )
 
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5
     n_threads: Optional[int] = 2
     paragraph_number: int = Field(default=1, ge=1, le=10)
-    video_script_prompt: str = Field(default="", max_length=2000)
+    video_script_prompt: str = Field(
+        default=config.app.get("default_script_prompt", ""), max_length=2000
+    )
     custom_system_prompt: str = Field(default="", max_length=8000)
 
 

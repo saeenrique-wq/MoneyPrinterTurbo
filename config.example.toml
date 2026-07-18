@@ -33,7 +33,7 @@ tls_verify = true
 # Video Materials / 视频素材
 # -----------------------------------------------------------------------------
 
-# Available values: "pexels", "pixabay", "coverr", "local".
+# Available values: "pexels", "pixabay", "coverr", "local", "seedance".
 video_source = "pexels"
 
 # API key lists support key rotation. Use straight ASCII double quotes and
@@ -49,6 +49,10 @@ pixabay_api_keys = []
 # Register at https://coverr.co/developers?ctx=header_navigation
 coverr_api_keys = []
 
+# AI-generated video clips (ByteDance Seedance 2.0) via fal.ai, billed per
+# second of generated video. Get a key at https://fal.ai/dashboard/keys
+seedance_api_key = []
+
 # Optional TwelveLabs integration for semantic material ranking and video QA.
 # Install the optional dependency with: uv sync --extra twelvelabs
 # Create an API key at https://playground.twelvelabs.io/
@@ -63,6 +67,16 @@ twelvelabs_rerank_terms = false
 # Match search terms and downloaded materials to the script narrative order.
 # 默认关闭，开启后会减少随机性，使素材顺序更贴近文案结构。
 match_materials_to_script = false
+
+# Cinematic color grade (contrast/saturation boost + soft vignette) applied
+# to every downloaded clip during assembly.
+cinematic_grade_enabled = true
+
+# Default script-writing instructions applied to every generation unless
+# overridden per-call (leave empty to disable). A good default encodes
+# short-form retention rules: hook in the first line, one idea per video,
+# no filler intro, no generic "subscribe" CTA.
+default_script_prompt = ""
 
 # -----------------------------------------------------------------------------
 # LLM Providers / 大模型提供商

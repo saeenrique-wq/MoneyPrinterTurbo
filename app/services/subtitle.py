@@ -65,10 +65,16 @@ def create(audio_file, subtitle_file: str = ""):
 
     start = timer()
     subtitles = []
+    # Per-line list of {text, start, end} word dicts, aligned by index with
+    # `subtitles`. Used to render word-by-word animated captions; kept
+    # separate from the .srt file since SRT has no per-word timing concept.
+    line_words: list[list[dict]] = []
+    pending_words: list[dict] = []
 
     def recognized(seg_text, seg_start, seg_end):
         seg_text = seg_text.strip()
         if not seg_text:
+            pending_words.clear()
             return
 
         msg = "[%.2fs -> %.2fs] %s" % (seg_start, seg_end, seg_text)
@@ -77,6 +83,8 @@ def create(audio_file, subtitle_file: str = ""):
         subtitles.append(
             {"msg": seg_text, "start_time": seg_start, "end_time": seg_end}
         )
+        line_words.append(pending_words.copy())
+        pending_words.clear()
 
     for segment in segments:
         words_idx = 0
@@ -96,6 +104,11 @@ def create(audio_file, subtitle_file: str = ""):
                 seg_end = word.end
                 # If it contains punctuation, then break the sentence.
                 seg_text += word.word
+                clean_word = word.word.strip()
+                if clean_word:
+                    pending_words.append(
+                        {"text": clean_word, "start": word.start, "end": word.end}
+                    )
 
                 if utils.str_contains_punctuation(word.word):
                     # remove last char
@@ -140,6 +153,40 @@ def create(audio_file, subtitle_file: str = ""):
     with open(subtitle_file, "w", encoding="utf-8") as f:
         f.write(sub)
     logger.info(f"subtitle file created: {subtitle_file}")
+
+    write_word_timing_sidecar(subtitle_file, subtitles, line_words)
+
+
+def word_timing_sidecar_path(subtitle_file: str) -> str:
+    return f"{subtitle_file}.words.json"
+
+
+def write_word_timing_sidecar(
+    subtitle_file: str, subtitles: list[dict], line_words: list[list[dict]]
+) -> None:
+    """Persist per-word timestamps next to the .srt file.
+
+    SRT has no concept of per-word timing, so word-by-word animated
+    captions need this sidecar. Only whisper (subtitle_provider="whisper")
+    produces word-level timestamps; other providers never call this.
+    """
+    try:
+        payload = []
+        for subtitle, words in zip(subtitles, line_words):
+            payload.append(
+                {
+                    "start": subtitle.get("start_time"),
+                    "end": subtitle.get("end_time"),
+                    "text": subtitle.get("msg"),
+                    "words": words,
+                }
+            )
+        sidecar_path = word_timing_sidecar_path(subtitle_file)
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        logger.info(f"word timing sidecar created: {sidecar_path}")
+    except Exception as exc:
+        logger.warning(f"failed to write word timing sidecar: {exc}")
 
 
 def file_to_subtitles(filename):
@@ -197,13 +244,42 @@ def similarity(a, b):
     return 1 - (distance / max_length)
 
 
+def _srt_timestamp_to_seconds(timestamp: str) -> float:
+    """Parse an SRT timestamp ("HH:MM:SS,mmm") into seconds."""
+    hms, _, millis = timestamp.strip().partition(",")
+    hours, minutes, seconds = (int(part) for part in hms.split(":"))
+    return hours * 3600 + minutes * 60 + seconds + int(millis or 0) / 1000
+
+
+def _load_word_sidecar(subtitle_file: str) -> list:
+    sidecar_path = word_timing_sidecar_path(subtitle_file)
+    if not os.path.isfile(sidecar_path):
+        return []
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        logger.warning(f"failed to load word timing sidecar for correction: {exc}")
+        return []
+
+
 def correct(subtitle_file, video_script):
     subtitle_items = file_to_subtitles(subtitle_file)
     normalized_script = utils.normalize_script_for_subtitle_matching(video_script)
     script_lines = utils.split_string_by_punctuations(normalized_script)
 
+    # Word-level timing (whisper only) is index-aligned with `subtitle_items`
+    # at this point. As lines below get merged/split to match the script,
+    # `source_ranges` records which original indices fed each output line so
+    # the sidecar can be rebuilt instead of thrown away — throwing it away on
+    # every trivial correction (a re-cased word, a dropped accent) would
+    # disable animated captions on almost every real generation, since
+    # whisper transcripts essentially never match the script byte-for-byte.
+    original_words = [item.get("words", []) for item in _load_word_sidecar(subtitle_file)]
+
     corrected = False
     new_subtitle_items = []
+    source_ranges: list[tuple[int, int] | None] = []
     script_index = 0
     subtitle_index = 0
 
@@ -213,6 +289,7 @@ def correct(subtitle_file, video_script):
 
         if script_line == subtitle_line:
             new_subtitle_items.append(subtitle_items[subtitle_index])
+            source_ranges.append((subtitle_index, subtitle_index + 1))
             script_index += 1
             subtitle_index += 1
         else:
@@ -243,6 +320,7 @@ def correct(subtitle_file, video_script):
                         script_line,
                     )
                 )
+                source_ranges.append((subtitle_index, next_subtitle_index))
                 corrected = True
             else:
                 logger.warning(
@@ -255,6 +333,7 @@ def correct(subtitle_file, video_script):
                         script_line,
                     )
                 )
+                source_ranges.append((subtitle_index, next_subtitle_index))
                 corrected = True
 
             script_index += 1
@@ -271,6 +350,7 @@ def correct(subtitle_file, video_script):
                     script_lines[script_index],
                 )
             )
+            source_ranges.append((subtitle_index, subtitle_index + 1))
             subtitle_index += 1
         else:
             new_subtitle_items.append(
@@ -280,6 +360,9 @@ def correct(subtitle_file, video_script):
                     script_lines[script_index],
                 )
             )
+            # No original line backs this entry (script ran longer than the
+            # transcript), so there's no word timing to carry forward.
+            source_ranges.append(None)
         script_index += 1
         corrected = True
 
@@ -288,6 +371,31 @@ def correct(subtitle_file, video_script):
             for i, item in enumerate(new_subtitle_items):
                 fd.write(f"{i + 1}\n{item[1]}\n{item[2]}\n\n")
         logger.info("Subtitle corrected")
+
+        sidecar_path = word_timing_sidecar_path(subtitle_file)
+        if original_words:
+            merged_payload = []
+            for item, source_range in zip(new_subtitle_items, source_ranges):
+                words = []
+                if source_range:
+                    start, end = source_range
+                    for idx in range(start, min(end, len(original_words))):
+                        words.extend(original_words[idx])
+                times = item[1].split(" --> ")
+                merged_payload.append(
+                    {
+                        "start": _srt_timestamp_to_seconds(times[0]),
+                        "end": _srt_timestamp_to_seconds(times[1]),
+                        "text": item[2],
+                        "words": words,
+                    }
+                )
+            try:
+                with open(sidecar_path, "w", encoding="utf-8") as f:
+                    json.dump(merged_payload, f, ensure_ascii=False)
+                logger.info(f"word timing sidecar re-aligned after correction: {sidecar_path}")
+            except Exception as exc:
+                logger.warning(f"failed to rewrite word timing sidecar: {exc}")
     else:
         logger.success("Subtitle is correct")
 

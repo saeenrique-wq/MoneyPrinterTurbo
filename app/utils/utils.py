@@ -110,8 +110,7 @@ def task_dir(sub_dir: str = ""):
     d = os.path.join(storage_dir(), "tasks")
     if sub_dir:
         d = os.path.join(d, sub_dir)
-    if not os.path.exists(d):
-        os.makedirs(d)
+    os.makedirs(d, exist_ok=True)
     return d
 
 

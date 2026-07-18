@@ -36,8 +36,10 @@ from app.models.schema import (
     VideoTransitionMode,
 )
 from app.services import bgm as bgm_service
+from app.services import subtitle as subtitle_service
 from app.services.utils import video_effects
 from app.utils import file_security, utils
+import json
 
 class SubClippedVideoClip:
     def __init__(
@@ -681,6 +683,9 @@ def combine_videos(
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
+            if config.app.get("cinematic_grade_enabled", True):
+                clip = video_effects.cinematic_grade(clip)
+
             if clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
                 
@@ -959,6 +964,200 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
+@lru_cache(maxsize=256)
+def _measure_word_size(word: str, font_path: str, font_size: int) -> tuple[int, int]:
+    font = ImageFont.truetype(font_path, font_size)
+    bbox = font.getbbox(word)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def _load_word_timed_lines(subtitle_path: str) -> list:
+    """Load the per-word timing sidecar written by app.services.subtitle.create().
+
+    Returns an empty list when the sidecar is missing (e.g. non-whisper TTS
+    providers, or subtitle.correct() invalidated it after merging lines) so
+    callers can fall back to static line-level captions.
+    """
+    sidecar_path = subtitle_service.word_timing_sidecar_path(subtitle_path)
+    if not os.path.isfile(sidecar_path):
+        return []
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        logger.warning(f"failed to load word timing sidecar: {exc}")
+        return []
+
+
+def create_animated_caption_clip(
+    line: dict,
+    video_width: int,
+    video_height: int,
+    params: VideoParams,
+    font_path: str,
+):
+    """Build one word-by-word animated caption block (TikTok/CapCut style).
+
+    Every word renders twice, stacked at the same position: a base copy in
+    the normal subtitle color visible for the whole line, and a highlight
+    copy in the accent color visible only during that word's speech window
+    (with a quick fade-in "pop"). Returns None when there's no word timing
+    for this line, so the caller can fall back to static rendering.
+    """
+    words = line.get("words") or []
+    if not words:
+        return None
+
+    line_start = line["start"]
+    line_end = line["end"]
+    duration = max(line_end - line_start, 0.05)
+
+    font_size = int(params.font_size)
+    space_w, _ = _measure_word_size(" ", font_path, font_size)
+    max_width = int(video_width * 0.85)
+    row_height = int(font_size * 1.35)
+
+    rows: list[list[dict]] = []
+    current_row: list[dict] = []
+    current_x = 0
+    for word in words:
+        text = (word.get("text") or "").strip()
+        if not text:
+            continue
+        w_w, w_h = _measure_word_size(text, font_path, font_size)
+        if current_row and current_x + w_w > max_width:
+            rows.append(current_row)
+            current_row = []
+            current_x = 0
+        current_row.append({**word, "text": text, "w": w_w, "h": w_h, "x": current_x})
+        current_x += w_w + space_w
+    if current_row:
+        rows.append(current_row)
+    if not rows:
+        return None
+
+    block_width = min(
+        max((w["x"] + w["w"] for row in rows for w in row), default=max_width),
+        max_width,
+    )
+    block_height = row_height * len(rows)
+
+    sub_clips = []
+    for row_idx, row in enumerate(rows):
+        row_width = row[-1]["x"] + row[-1]["w"]
+        row_x_offset = (block_width - row_width) / 2
+        y = row_idx * row_height
+        for word in row:
+            x = row_x_offset + word["x"]
+            rel_start = max(word["start"] - line_start, 0)
+            rel_end = max(word["end"] - line_start, rel_start + 0.05)
+
+            base_clip = (
+                TextClip(
+                    text=word["text"],
+                    font=font_path,
+                    font_size=font_size,
+                    color=params.text_fore_color,
+                    stroke_color=params.stroke_color,
+                    stroke_width=params.stroke_width,
+                )
+                .with_position((x, y))
+                .with_duration(duration)
+            )
+            sub_clips.append(base_clip)
+
+            highlight_clip = (
+                TextClip(
+                    text=word["text"],
+                    font=font_path,
+                    font_size=font_size,
+                    color=params.animated_caption_highlight_color,
+                    stroke_color=params.stroke_color,
+                    stroke_width=params.stroke_width,
+                )
+                .with_position((x, y))
+                .with_start(rel_start)
+                .with_end(rel_end)
+            )
+            highlight_clip = video_effects.fadein_transition(
+                highlight_clip, min(0.08, (rel_end - rel_start) / 2)
+            )
+            sub_clips.append(highlight_clip)
+
+    block = CompositeVideoClip(
+        sub_clips, size=(int(block_width), int(block_height))
+    ).with_duration(duration)
+    block = block.with_start(line_start).with_end(line_end)
+
+    if params.subtitle_position == "bottom":
+        block = block.with_position(("center", video_height * _SAFE_ZONE_BOTTOM - block.h))
+    elif params.subtitle_position == "top":
+        block = block.with_position(("center", video_height * _SAFE_ZONE_TOP))
+    elif params.subtitle_position == "custom":
+        margin = 10
+        max_y = video_height - block.h - margin
+        min_y = margin
+        custom_y = (video_height - block.h) * (params.custom_position / 100)
+        custom_y = max(min_y, min(custom_y, max_y))
+        block = block.with_position(("center", custom_y))
+    else:
+        block = block.with_position(("center", "center"))
+
+    return block
+
+
+# Vertical-video platform UI (TikTok/Reels/Shorts profile pic, sound icon,
+# caption bar, action rail, CTA) reliably covers the top ~20% and bottom ~25%
+# of the frame. Captions placed at the old 0.95/0.05 offsets sat inside that
+# dead zone and were routinely hidden behind the app chrome.
+_SAFE_ZONE_TOP = 0.20
+_SAFE_ZONE_BOTTOM = 0.75
+
+# Caption chunking: whisper's own sentence segmentation can span 15-20+
+# seconds of speech in one subtitle line, which would put a wall of text
+# on screen for the whole sentence. Professional-looking captions (TikTok/
+# CapCut style) show a handful of words at a time instead. These bounds
+# are independent of whisper's line breaks — they regroup the flat word
+# stream by count, duration, and natural pause gaps.
+_CAPTION_MAX_WORDS = 4
+_CAPTION_MAX_DURATION = 2.2
+_CAPTION_PAUSE_GAP = 0.6
+
+
+def _regroup_words_into_captions(word_lines: list) -> list:
+    """Flatten every line's words and rechunk into short caption bursts."""
+    flat_words = [word for line in word_lines for word in (line.get("words") or [])]
+    if not flat_words:
+        return []
+
+    chunks = []
+    current: list[dict] = []
+    for word in flat_words:
+        if current:
+            gap = word["start"] - current[-1]["end"]
+            duration = word["end"] - current[0]["start"]
+            if (
+                len(current) >= _CAPTION_MAX_WORDS
+                or duration > _CAPTION_MAX_DURATION
+                or gap > _CAPTION_PAUSE_GAP
+            ):
+                chunks.append(current)
+                current = []
+        current.append(word)
+    if current:
+        chunks.append(current)
+
+    return [
+        {
+            "start": chunk[0]["start"],
+            "end": chunk[-1]["end"],
+            "text": " ".join(w["text"] for w in chunk),
+            "words": chunk,
+        }
+        for chunk in chunks
+    ]
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -1131,9 +1330,9 @@ def generate_video(
         _clip = _clip.with_end(subtitle_item[0][1])
         _clip = _clip.with_duration(duration)
         if params.subtitle_position == "bottom":
-            _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
+            _clip = _clip.with_position(("center", video_height * _SAFE_ZONE_BOTTOM - _clip.h))
         elif params.subtitle_position == "top":
-            _clip = _clip.with_position(("center", video_height * 0.05))
+            _clip = _clip.with_position(("center", video_height * _SAFE_ZONE_TOP))
         elif params.subtitle_position == "custom":
             # Ensure the subtitle is fully within the screen bounds
             margin = 10  # Additional margin, in pixels
@@ -1164,10 +1363,36 @@ def generate_video(
         sub = SubtitlesClip(
             subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
         )
+
+        word_lines = (
+            _load_word_timed_lines(subtitle_path)
+            if getattr(params, "animated_captions", False)
+            else []
+        )
+        caption_chunks = _regroup_words_into_captions(word_lines) if word_lines else []
+
         text_clips = []
-        for item in sub.subtitles:
-            clip = create_text_clip(subtitle_item=item)
-            text_clips.append(clip)
+        if caption_chunks:
+            # Short word-burst captions (TikTok/CapCut style), independent
+            # of whisper's own sentence-length line breaks.
+            for chunk in caption_chunks:
+                clip = create_animated_caption_clip(
+                    line=chunk,
+                    video_width=video_width,
+                    video_height=video_height,
+                    params=params,
+                    font_path=font_path,
+                )
+                if clip is not None:
+                    text_clips.append(clip)
+        else:
+            if getattr(params, "animated_captions", False):
+                logger.info(
+                    "animated captions requested but no usable word timing found "
+                    "(requires subtitle_provider=whisper); falling back to static subtitles"
+                )
+            for item in sub.subtitles:
+                text_clips.append(create_text_clip(subtitle_item=item))
         video_clip = CompositeVideoClip([video_clip, *text_clips])
 
     bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
