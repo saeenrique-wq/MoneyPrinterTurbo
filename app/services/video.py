@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import itertools
 import io
 import os
@@ -971,6 +972,52 @@ def _measure_word_size(word: str, font_path: str, font_size: int) -> tuple[int, 
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
 
+_WORD_PNG_CACHE_DIR = os.path.join(tempfile.gettempdir(), "mpt_caption_png_cache")
+
+
+@lru_cache(maxsize=1024)
+def _render_word_png(
+    text: str, font_path: str, font_size: int, color: str, stroke_color: str, stroke_width: int
+) -> tuple[str, int]:
+    """Render one caption word to a padded transparent PNG via PIL.
+
+    moviepy's TextClip(method='label'/'caption') crops to a bounding box that
+    clips ascenders and descenders (e.g. the tail of 'j', accented vowels) -
+    this bypasses TextClip entirely and draws with generous padding instead.
+    Returns (png_path, pad) where `pad` is how far the padded canvas extends
+    beyond the word's nominal (unpadded) origin, so callers can offset the
+    clip position by -pad to land the glyph ink exactly where a tight box
+    would have (matching the existing width from `_measure_word_size`).
+    """
+    os.makedirs(_WORD_PNG_CACHE_DIR, exist_ok=True)
+    font = ImageFont.truetype(font_path, font_size)
+    bbox0 = font.getbbox(text)
+    w = bbox0[2] - bbox0[0]
+    h = bbox0[3] - bbox0[1]
+    stroke_width = int(stroke_width or 0)
+    pad = stroke_width + max(6, font_size // 5)
+
+    key = hashlib.sha1(
+        f"{text}|{font_path}|{font_size}|{color}|{stroke_color}|{stroke_width}".encode("utf-8")
+    ).hexdigest()[:24]
+    path = os.path.join(_WORD_PNG_CACHE_DIR, f"{key}.png")
+
+    if not os.path.isfile(path):
+        img = Image.new("RGBA", (max(w, 1) + pad * 2, max(h, 1) + pad * 2), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.text(
+            (pad - bbox0[0], pad - bbox0[1]),
+            text,
+            font=font,
+            fill=color,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_color,
+        )
+        img.save(path)
+
+    return path, pad
+
+
 def _load_word_timed_lines(subtitle_path: str) -> list:
     """Load the per-word timing sidecar written by app.services.subtitle.create().
 
@@ -1015,7 +1062,10 @@ def create_animated_caption_clip(
     font_size = int(params.font_size)
     space_w, _ = _measure_word_size(" ", font_path, font_size)
     max_width = int(video_width * 0.85)
-    row_height = int(font_size * 1.35)
+    # 1.6x (not 1.35x) leaves headroom for the safety padding added in
+    # _render_word_png (stroke_width + ~font_size/5 on each side), so a
+    # padded word image never overflows into the next caption row.
+    row_height = int(font_size * 1.6)
 
     rows: list[list[dict]] = []
     current_row: list[dict] = []
@@ -1052,30 +1102,24 @@ def create_animated_caption_clip(
             rel_start = max(word["start"] - line_start, 0)
             rel_end = max(word["end"] - line_start, rel_start + 0.05)
 
+            base_png, base_pad = _render_word_png(
+                word["text"], font_path, font_size,
+                params.text_fore_color, params.stroke_color, params.stroke_width,
+            )
             base_clip = (
-                TextClip(
-                    text=word["text"],
-                    font=font_path,
-                    font_size=font_size,
-                    color=params.text_fore_color,
-                    stroke_color=params.stroke_color,
-                    stroke_width=params.stroke_width,
-                )
-                .with_position((x, y))
+                ImageClip(base_png)
+                .with_position((x - base_pad, y - base_pad))
                 .with_duration(duration)
             )
             sub_clips.append(base_clip)
 
+            hl_png, hl_pad = _render_word_png(
+                word["text"], font_path, font_size,
+                params.animated_caption_highlight_color, params.stroke_color, params.stroke_width,
+            )
             highlight_clip = (
-                TextClip(
-                    text=word["text"],
-                    font=font_path,
-                    font_size=font_size,
-                    color=params.animated_caption_highlight_color,
-                    stroke_color=params.stroke_color,
-                    stroke_width=params.stroke_width,
-                )
-                .with_position((x, y))
+                ImageClip(hl_png)
+                .with_position((x - hl_pad, y - hl_pad))
                 .with_start(rel_start)
                 .with_end(rel_end)
             )

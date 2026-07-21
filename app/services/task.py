@@ -42,10 +42,21 @@ def generate_terms(task_id, params, video_script):
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
         # 无法改善“后面内容的画面提前出现”的问题。
+        if params.match_materials_to_script:
+            # One term per ~5s clip slot gives closer narration-to-footage
+            # alignment than a fixed handful of broad terms covering the
+            # whole script (which left long stretches showing unrelated
+            # generic b-roll). Estimate spoken duration from word count
+            # (~2.5 words/sec) since audio isn't generated yet at this point.
+            est_words = len(video_script.split())
+            est_duration = est_words / 2.5
+            terms_amount = max(8, min(24, math.ceil(est_duration / 5)))
+        else:
+            terms_amount = 5
         video_terms = llm.generate_terms(
             video_subject=params.video_subject,
             video_script=video_script,
-            amount=8 if params.match_materials_to_script else 5,
+            amount=terms_amount,
             match_script_order=params.match_materials_to_script,
         )
     else:

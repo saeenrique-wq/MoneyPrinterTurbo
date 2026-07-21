@@ -628,6 +628,11 @@ def generate_terms(
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
 4. the search terms must be related to the subject of the video.
 5. reply with english search terms only.
+6. prefer concrete, literally filmable actions and objects over abstract
+   concepts or emotions (e.g. "man typing laptop night" or "counting cash
+   hands" instead of "desperate youth" or "hopeful future") - abstract
+   terms return generic stock footage that visually contradicts the
+   narration instead of illustrating it.
 {ordering_rule}
 
 ## Output Example:
