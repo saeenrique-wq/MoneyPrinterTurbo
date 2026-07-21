@@ -377,6 +377,10 @@ def _generate_response(prompt: str) -> str:
         client = OpenAI(
             api_key=api_key,
             base_url=base_url,
+            # Some OpenAI-compatible gateways (e.g. kie.ai) WAF-block the
+            # openai-python SDK's default User-Agent while allowing curl-like
+            # ones; this header is harmless against the real OpenAI API too.
+            default_headers={"User-Agent": "curl/8.0.1"},
         )
 
         response = client.chat.completions.create(
